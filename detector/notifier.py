@@ -1,3 +1,4 @@
+import os
 import requests
 import logging
 from datetime import datetime
@@ -14,13 +15,16 @@ class Notifier:
     """
 
     def __init__(self, config):
-        self.webhook_url = config["slack"]["webhook_url"]
+        self.webhook_url = os.environ.get(
+            "SLACK_WEBHOOK_URL",
+            config["slack"]["webhook_url"]
+        )
 
     def _send(self, message):
         """
         POST a message to the Slack webhook.
         """
-        if not self.webhook_url or self.webhook_url == "YOUR_SLACK_WEBHOOK_URL_HERE":
+        if not self.webhook_url:
             logger.warning("Slack webhook URL not configured — skipping alert.")
             return
 
