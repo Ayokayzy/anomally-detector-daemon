@@ -1,0 +1,31 @@
+detection:
+  z_score_threshold: 3.0        # Flag if z-score exceeds this
+  rate_multiplier: 5            # Flag if rate exceeds 5x baseline mean
+  error_surge_multiplier: 3     # Tighten thresholds if error rate is 3x baseline
+  tightened_z_threshold: 2.0    # Tightened z-score for IPs with error surges
+
+baseline:
+  window_minutes: 30            # Rolling history window
+  recalc_interval: 60           # Recalculate mean/stddev every 60 seconds
+  min_samples: 30               # Minimum samples before baseline is reliable
+
+sliding_window:
+  window_size: 60               # Track requests over last 60 seconds
+
+blocking:
+  unban_schedule:               # Backoff unban durations in seconds
+    - 600                       # 1st ban: 10 minutes
+    - 1800                      # 2nd ban: 30 minutes
+    - 7200                      # 3rd ban: 2 hours
+    - -1                        # 4th ban+: permanent
+
+slack:
+  webhook_url: "YOUR_SLACK_WEBHOOK_URL_HERE"
+
+dashboard:
+  port: 8080
+  refresh_interval: 3
+
+log:
+  audit_log_path: "/var/log/detector/audit.log"
+  nginx_log_path: "/var/log/nginx/hng-access.log"
