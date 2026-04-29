@@ -135,43 +135,35 @@ class RollingBaseline:
 
         logger.info("RollingBaseline initialized.")
 
-    def record(self, count):
+    def record(self, count, audit_logger=None):
         """
         Record a per-second request count into the rolling history.
-        Called once per second with the count from the sliding window.
         """
         now = time.time()
         current_hour = int(time.strftime("%H"))
 
-        # Add to rolling history
         self.history.append((now, count))
-
-        # Add to current hour's slot
         self.hourly_slots[current_hour].append(count)
 
-        # Evict entries older than window_seconds
         while self.history and now - self.history[0][0] > self.window_seconds:
             self.history.popleft()
 
-        # Recalculate baseline every recalc_interval seconds
         if now - self.last_recalc >= self.recalc_interval:
-            self._recalculate(current_hour)
+            self._recalculate(current_hour, audit_logger=audit_logger)
             self.last_recalc = now
 
-    def _recalculate(self, current_hour):
+    def _recalculate(self, current_hour, audit_logger=None):
         """
         Recompute mean and stddev.
         Prefer current hour's data if it has enough samples,
         otherwise fall back to the full rolling window.
         """
-        # Try current hour's data first
         hourly_data = self.hourly_slots[current_hour]
 
         if len(hourly_data) >= self.min_samples:
             data = hourly_data
             source = f"hour-{current_hour}"
         else:
-            # Fall back to full rolling window
             data = [count for _, count in self.history]
             source = "rolling-window"
 
@@ -183,7 +175,6 @@ class RollingBaseline:
         variance = sum((x - mean) ** 2 for x in data) / len(data)
         stddev = math.sqrt(variance)
 
-        # Apply floor values so we never divide by zero
         self.effective_mean = max(mean, 1.0)
         self.effective_stddev = max(stddev, 1.0)
 
@@ -194,6 +185,15 @@ class RollingBaseline:
             f"stddev={self.effective_stddev:.2f}"
         )
 
+        # Write to audit log if provided
+        if audit_logger:
+            audit_logger.log_baseline_recalc(
+                source=source,
+                samples=len(data),
+                mean=self.effective_mean,
+                stddev=self.effective_stddev
+            )
+        
     def get_baseline(self):
         """
         Return current effective mean and stddev.

@@ -45,7 +45,7 @@ def baseline_recorder():
     """
     while True:
         rate = window.get_global_rate()
-        baseline.record(rate)
+        baseline.record(rate, audit_logger=audit_logger)
         time.sleep(1)
 
 
