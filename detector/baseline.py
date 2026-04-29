@@ -32,6 +32,29 @@ class SlidingWindow:
         """
         Remove entries older than window_size seconds from the left of the deque.
         This is what makes the window 'slide' forward in time.
+
+        Deques are ordered chronologically — oldest timestamps sit on the left,
+        newest on the right. When a new request arrives and `now` advances,
+        anything on the left that falls outside the window becomes stale and must
+        be removed so the count always reflects the last `window_size` seconds.
+
+        Example (window_size = 60 seconds, now = 1000.0):
+
+            Before eviction:
+              dq = deque([930.0, 940.0, 950.0, 960.0, 980.0, 1000.0])
+
+            Eviction loop:
+              dq[0] = 930.0  →  now - 930.0 = 70.0 > 60  →  popleft()
+              dq[0] = 940.0  →  now - 940.0 = 60.0 == 60 →  stop (not strictly >)
+
+            After eviction:
+              dq = deque([940.0, 950.0, 960.0, 980.0, 1000.0])
+
+        The window now covers exactly [940.0, 1000.0] — 60 seconds of activity.
+
+        popleft() on a deque is O(1), making eviction efficient even under
+        very high request rates where many timestamps may need to be removed
+        in a single pass.
         """
         while dq and now - dq[0] > self.window_size:
             dq.popleft()
@@ -138,6 +161,43 @@ class RollingBaseline:
     def record(self, count, audit_logger=None):
         """
         Record a per-second request count into the rolling history.
+
+        Why per-second counts instead of raw timestamps?
+        -------------------------------------------------
+        The baseline recorder thread (in main.py) samples the global sliding
+        window once per second and passes the integer count here. Storing one
+        integer per second is far more memory-efficient than storing individual
+        request timestamps — under heavy traffic thousands of requests can arrive
+        in a single second, but we only ever store one number for that second.
+        This also makes the mean/stddev calculation cheaper: we sum a list of
+        ~1800 integers rather than iterating over potentially millions of floats.
+
+        How the 30-minute rolling window works:
+        ----------------------------------------
+        `self.history` is a deque of (timestamp, count) tuples. Each call to
+        record() appends a new entry on the right. The while-loop immediately
+        after the append evicts any entries from the left whose timestamp is
+        older than `window_seconds` (30 × 60 = 1800 seconds).
+
+        Over time the deque stabilises at ~1800 entries (one per second for
+        30 minutes). As each new second arrives on the right, the oldest second
+        drops off the left — the window slides forward without ever growing
+        unboundedly in memory.
+
+        Hourly slots:
+        The same count is also appended to `self.hourly_slots[current_hour]`
+        (keyed 0–23 by clock hour). _recalculate() prefers same-hour data when
+        it has enough samples, because traffic patterns are strongly time-of-day
+        dependent — mixing 3 AM data with 3 PM data inflates stddev and weakens
+        detection sensitivity.
+
+        Why recalculation is not triggered on every request:
+        -------------------------------------------------------
+        Mean and stddev change gradually. Recomputing statistics every single
+        second (let alone every request) would waste CPU and produce identical
+        results nearly every call. A 60-second recalculation window provides
+        fresh-enough statistics (the baseline is at most 60 seconds stale)
+        while keeping overhead negligible even under very high request volumes.
         """
         now = time.time()
         current_hour = int(time.strftime("%H"))
@@ -154,9 +214,48 @@ class RollingBaseline:
 
     def _recalculate(self, current_hour, audit_logger=None):
         """
-        Recompute mean and stddev.
-        Prefer current hour's data if it has enough samples,
-        otherwise fall back to the full rolling window.
+        Recompute effective_mean and effective_stddev from available traffic data.
+
+        Data source priority:
+        ----------------------
+        1. Current-hour slot (preferred):
+           If `self.hourly_slots[current_hour]` has at least `min_samples`
+           entries, those are used exclusively. Same-hour data reflects the
+           typical traffic pattern for this time of day. Traffic at 3 AM is
+           structurally different from traffic at 3 PM — mixing them would
+           inflate stddev, raising the bar for z-score detection and letting
+           attackers hide in the noise.
+
+        2. Rolling window (fallback):
+           If the current hour lacks enough data (e.g., the first 30 seconds
+           after midnight, or when the daemon first starts), all data in the
+           30-minute rolling window is used regardless of hour. This ensures
+           the detector stays operational during warm-up without crashing.
+
+        Floor values of 1.0:
+        ----------------------
+        After computing mean and stddev from the data, both values are clamped
+        to a minimum of 1.0 via `max(value, 1.0)`. Two reasons:
+
+          - A mean of 0 would imply "zero requests per second is normal", which
+            makes the z-score meaningless on any non-zero traffic.
+          - A stddev of 0 means all sampled counts were identical. While
+            _compute_zscore() handles the zero-division case by returning 0,
+            a stddev floor of 1.0 keeps the z-score scaled sensibly and avoids
+            completely disabling statistical detection during dead-quiet periods.
+
+        Together the floors mean: "assume at least one request per second with
+        one request per second of variability" — a safe conservative minimum
+        that prevents false positives on legitimate zero-traffic windows.
+
+        Why recalculate every 60 seconds instead of every request:
+        ------------------------------------------------------------
+        Mean and stddev change slowly. Recalculating on every single request
+        would be pure waste — the result would be nearly identical 999 times
+        out of 1000. One recalculation per 60 seconds produces statistics that
+        are at most 60 seconds stale, which is accurate enough for the
+        detector's z-score checks while keeping CPU overhead near zero even
+        under attack-level request volumes.
         """
         hourly_data = self.hourly_slots[current_hour]
 
