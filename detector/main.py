@@ -5,6 +5,10 @@ import yaml
 from monitor import start_monitoring
 from baseline import SlidingWindow, RollingBaseline
 from detector import AnomalyDetector
+from blocker import Blocker
+from unbanner import Unbanner
+from audit import AuditLogger
+from notifier import Notifier  # we'll build this in Phase 6
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,25 +23,25 @@ with open("config.yaml", "r") as f:
 
 LOG_PATH = config["log"]["nginx_log_path"]
 
-# Initialize components
-window = SlidingWindow(
-    window_size=config["sliding_window"]["window_size"]
-)
+# Initialize all components
+window = SlidingWindow(window_size=config["sliding_window"]["window_size"])
 baseline = RollingBaseline(
     window_minutes=config["baseline"]["window_minutes"],
     recalc_interval=config["baseline"]["recalc_interval"],
     min_samples=config["baseline"]["min_samples"]
 )
 detector = AnomalyDetector(config)
+blocker = Blocker(config)
+audit_logger = AuditLogger(config["log"]["audit_log_path"])
+notifier = Notifier(config)  # stub for now
+unbanner = Unbanner(blocker, notifier, audit_logger)
 
-# Track baseline error rate (errors per 60s window)
 baseline_error_rate = 1.0
 
 
 def baseline_recorder():
     """
-    Runs in background thread.
-    Every second, records current global rate into the rolling baseline.
+    Background thread — records global rate into baseline every second.
     """
     while True:
         rate = window.get_global_rate()
@@ -48,22 +52,22 @@ def baseline_recorder():
 def handle_request(entry):
     """
     Called for every parsed log entry.
-    Updates sliding window and runs anomaly detection.
     """
     global baseline_error_rate
 
     ip = entry["source_ip"]
     status = entry["status"]
 
+    # Skip already-banned IPs — no need to recheck
+    if blocker.is_banned(ip):
+        return
+
     # Update sliding window
     window.add(ip, status)
 
-    # Get current rates
     ip_rate = window.get_ip_rate(ip)
     global_rate = window.get_global_rate()
     ip_error_rate = window.get_ip_error_rate(ip)
-
-    # Get current baseline
     mean, stddev = baseline.get_baseline()
 
     logger.info(
@@ -72,49 +76,67 @@ def handle_request(entry):
         f"Status: {status} | "
         f"IP Rate: {ip_rate}/60s | "
         f"Global Rate: {global_rate}/60s | "
-        f"Mean: {mean:.2f} | "
-        f"Stddev: {stddev:.2f}"
+        f"Mean: {mean:.2f} | Stddev: {stddev:.2f}"
     )
 
-    # Run per-IP anomaly check
+    # Check per-IP anomaly
     ip_anomaly = detector.check_ip(
         ip, ip_rate, ip_error_rate,
         mean, stddev, baseline_error_rate
     )
 
     if ip_anomaly:
-        logger.warning(
-            f"[ANOMALY DETECTED] Type: IP | "
-            f"IP: {ip} | "
-            f"Condition: {ip_anomaly['condition']} | "
-            f"Rate: {ip_rate} | "
-            f"Mean: {mean:.2f}"
+        duration = blocker.ban(
+            ip=ip,
+            condition=ip_anomaly["condition"],
+            rate=ip_rate,
+            mean=mean
         )
-        # blocker.py will be wired in here in Phase 5
 
-    # Run global anomaly check
+        if duration is not None:
+            # Write to audit log
+            audit_logger.log_ban(
+                ip=ip,
+                condition=ip_anomaly["condition"],
+                rate=ip_rate,
+                mean=mean,
+                duration=duration
+            )
+
+            # Send Slack alert (Phase 6)
+            notifier.send_ban_alert(
+                ip=ip,
+                condition=ip_anomaly["condition"],
+                rate=ip_rate,
+                mean=mean,
+                duration=duration
+            )
+
+    # Check global anomaly — Slack alert only, no IP block
     global_anomaly = detector.check_global(global_rate, mean, stddev)
 
     if global_anomaly:
         logger.warning(
-            f"[ANOMALY DETECTED] Type: GLOBAL | "
-            f"Condition: {global_anomaly['condition']} | "
-            f"Rate: {global_rate} | "
-            f"Mean: {mean:.2f}"
+            f"[GLOBAL ANOMALY] Condition: {global_anomaly['condition']} | "
+            f"Rate: {global_rate} | Mean: {mean:.2f}"
         )
-        # notifier.py will be wired in here in Phase 5
+        notifier.send_global_alert(
+            condition=global_anomaly["condition"],
+            rate=global_rate,
+            mean=mean
+        )
 
 
 def main():
     logger.info("Detector daemon starting up...")
 
     # Start baseline recorder thread
-    recorder_thread = threading.Thread(
-        target=baseline_recorder,
-        daemon=True
-    )
-    recorder_thread.start()
+    threading.Thread(target=baseline_recorder, daemon=True).start()
     logger.info("Baseline recorder thread started.")
+
+    # Start unbanner thread
+    threading.Thread(target=unbanner.run, daemon=True).start()
+    logger.info("Unbanner thread started.")
 
     # Start monitoring — blocks forever
     start_monitoring(LOG_PATH, handle_request)
