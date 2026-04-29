@@ -20,7 +20,7 @@ blocking:
     - -1                        # 4th ban+: permanent
 
 slack:
-  webhook_url: "YOUR_SLACK_WEBHOOK_URL_HERE"
+  webhook_url: "${SLACK_WEBHOOK_URL}"
 
 dashboard:
   port: 8080
