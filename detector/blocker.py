@@ -34,6 +34,13 @@ class Blocker:
         has been banned before (backoff schedule).
         Returns the ban duration in seconds, or -1 for permanent.
         """
+
+        # Never try to ban an empty IP
+        if not ip or not ip.strip():
+            logger.warning("Attempted to ban empty IP — skipping.")
+            return None
+
+
         # If already banned, don't ban again
         if self.is_banned(ip):
             return None

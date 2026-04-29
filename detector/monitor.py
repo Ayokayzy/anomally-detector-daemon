@@ -41,6 +41,11 @@ def parse_line(line):
     try:
         entry = json.loads(line)
 
+        # Use X-Forwarded-For if available, fall back to real_ip
+        source_ip = entry.get("source_ip", "").strip()
+        if not source_ip:
+            source_ip = entry.get("real_ip", "").strip()
+
         return {
             "source_ip": entry.get("source_ip", ""),
             "timestamp": entry.get("timestamp", ""),
