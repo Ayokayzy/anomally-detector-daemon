@@ -8,7 +8,8 @@ from detector import AnomalyDetector
 from blocker import Blocker
 from unbanner import Unbanner
 from audit import AuditLogger
-from notifier import Notifier  # we'll build this in Phase 6
+from notifier import Notifier
+from dashboard import Dashboard
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,16 +34,14 @@ baseline = RollingBaseline(
 detector = AnomalyDetector(config)
 blocker = Blocker(config)
 audit_logger = AuditLogger(config["log"]["audit_log_path"])
-notifier = Notifier(config)  # stub for now
+notifier = Notifier(config)
 unbanner = Unbanner(blocker, notifier, audit_logger)
+dashboard = Dashboard(config, window, baseline, blocker)
 
 baseline_error_rate = 1.0
 
 
 def baseline_recorder():
-    """
-    Background thread — records global rate into baseline every second.
-    """
     while True:
         rate = window.get_global_rate()
         baseline.record(rate, audit_logger=audit_logger)
@@ -50,19 +49,14 @@ def baseline_recorder():
 
 
 def handle_request(entry):
-    """
-    Called for every parsed log entry.
-    """
     global baseline_error_rate
 
     ip = entry["source_ip"]
     status = entry["status"]
 
-    # Skip already-banned IPs — no need to recheck
     if blocker.is_banned(ip):
         return
 
-    # Update sliding window
     window.add(ip, status)
 
     ip_rate = window.get_ip_rate(ip)
@@ -79,7 +73,6 @@ def handle_request(entry):
         f"Mean: {mean:.2f} | Stddev: {stddev:.2f}"
     )
 
-    # Check per-IP anomaly
     ip_anomaly = detector.check_ip(
         ip, ip_rate, ip_error_rate,
         mean, stddev, baseline_error_rate
@@ -94,7 +87,6 @@ def handle_request(entry):
         )
 
         if duration is not None:
-            # Write to audit log
             audit_logger.log_ban(
                 ip=ip,
                 condition=ip_anomaly["condition"],
@@ -102,8 +94,6 @@ def handle_request(entry):
                 mean=mean,
                 duration=duration
             )
-
-            # Send Slack alert (Phase 6)
             notifier.send_ban_alert(
                 ip=ip,
                 condition=ip_anomaly["condition"],
@@ -112,7 +102,6 @@ def handle_request(entry):
                 duration=duration
             )
 
-    # Check global anomaly — Slack alert only, no IP block
     global_anomaly = detector.check_global(global_rate, mean, stddev)
 
     if global_anomaly:
@@ -137,6 +126,10 @@ def main():
     # Start unbanner thread
     threading.Thread(target=unbanner.run, daemon=True).start()
     logger.info("Unbanner thread started.")
+
+    # Start dashboard thread
+    threading.Thread(target=dashboard.run, daemon=True).start()
+    logger.info("Dashboard thread started.")
 
     # Start monitoring — blocks forever
     start_monitoring(LOG_PATH, handle_request)
